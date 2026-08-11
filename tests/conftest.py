@@ -27,6 +27,8 @@ PATH_RULES = {
     "/tests/io/test_input_processor.py": ("data", True),
     # vtl tests
     "/tests/toolkit/vtl/": ("vtl", True),
+    # mcp tests
+    "/tests/toolkit/mcp/": ("mcp", True),
     # noextra tests
     "/tests/io/test_reader_without_extras.py": ("noextra", True),
     "/tests/model/": ("noextra", True),
