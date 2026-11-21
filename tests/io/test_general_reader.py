@@ -1,12 +1,14 @@
+import contextlib
 import json
 import re
 from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
+import pandas as pd
 import pytest
 
-import pysdmx.io.input_processor as m
+from pysdmx.api.qb import lenient
 from pysdmx.errors import Invalid, NotImplemented
 from pysdmx.io import read_sdmx
 from pysdmx.io.reader import get_datasets
@@ -38,6 +40,14 @@ def empty_message():
 
 
 @pytest.fixture
+def empty_data_message():
+    file_path = Path(__file__).parent / "samples" / "empty_data_message.xml"
+    with open(file_path, "r") as f:
+        text = f.read()
+    return text
+
+
+@pytest.fixture
 def sdmx_json():
     file_path = Path(__file__).parent / "samples" / "sdmx.json"
     with open(file_path, "r") as f:
@@ -54,6 +64,26 @@ def sdmx_json_20_structure():
         / "samples"
         / "code"
         / "freq.json"
+    )
+    with open(file_path, "r") as f:
+        text = f.read()
+    return text
+
+
+@pytest.fixture
+def sdmx_json_20_empty_structure():
+    file_path = (
+        Path(__file__).parent / "samples" / "empty_structure_message.json"
+    )
+    with open(file_path, "r") as f:
+        text = f.read()
+    return text
+
+
+@pytest.fixture
+def sdmx_json_20_structure_meta_only():
+    file_path = (
+        Path(__file__).parent / "samples" / "structure_message_meta_only.json"
     )
     with open(file_path, "r") as f:
         text = f.read()
@@ -207,7 +237,7 @@ def mock_ssl_context(monkeypatch):
         seen["verify"] = verify
         return "CTX"
 
-    monkeypatch.setattr(m, "create_ssl_context", mock_create_ssl_context)
+    monkeypatch.setattr(httpx, "create_ssl_context", mock_create_ssl_context)
     return seen
 
 
@@ -219,6 +249,9 @@ def mock_http_client(monkeypatch, structures_path):
         status_code=200,
         text=xml_text,
         raise_for_status=lambda: None,
+        encoding="utf-8",
+        iter_bytes=lambda chunk_size=None: iter([xml_text.encode("utf-8")]),
+        request=None,
     )
 
     class DummyClient:
@@ -226,13 +259,15 @@ def mock_http_client(monkeypatch, structures_path):
             last["kwargs"] = kwargs
 
         def __enter__(self):
-            self.get = lambda u, timeout=60: mock_response
             return self
+
+        def stream(self, method, u, headers=None, timeout=60):
+            return contextlib.nullcontext(mock_response)
 
         def __exit__(self, *a):
             return False
 
-    monkeypatch.setattr(m, "httpx_Client", DummyClient)
+    monkeypatch.setattr(httpx, "Client", DummyClient)
     return last
 
 
@@ -293,6 +328,114 @@ def test_read_url_valid(respx_mock, data_csv_v1_str):
 
 
 @pytest.mark.data
+def test_read_url_timeout(respx_mock, data_csv_v1_str):
+    url = "http://validurl.com"
+    route = respx_mock.get(url).mock(
+        return_value=httpx.Response(200, content=data_csv_v1_str)
+    )
+
+    read_sdmx(url, timeout=12.0)
+
+    assert route.calls[0].request.extensions["timeout"]["read"] == 12.0
+
+
+@pytest.mark.data
+def test_read_url_default_timeout(respx_mock, data_csv_v1_str):
+    url = "http://validurl.com"
+    route = respx_mock.get(url).mock(
+        return_value=httpx.Response(200, content=data_csv_v1_str)
+    )
+
+    read_sdmx(url)
+
+    assert route.calls[0].request.extensions["timeout"]["read"] == 600.0
+
+
+def test_get_datasets_url_timeout(respx_mock, data_path, structures_path):
+    data_url = "http://validurl.com/data"
+    structure_url = "http://validurl.com/structure"
+    routes = [
+        respx_mock.get(url).mock(
+            return_value=httpx.Response(200, content=Path(path).read_bytes())
+        )
+        for url, path in (
+            (data_url, data_path),
+            (structure_url, structures_path),
+        )
+    ]
+
+    get_datasets(data_url, structure_url, timeout=12.0)
+
+    for route in routes:
+        assert route.calls[0].request.extensions["timeout"]["read"] == 12.0
+
+
+# Eurostat's SDMX API queues a large data query as an asynchronous
+# extraction, and answers with its id instead of the data
+EXTRACTION = "423abd6b-c7b0-4530-b249-7216bf78c785"
+EUROSTAT = "https://ec.europa.eu/eurostat/api/dissemination"
+EUROSTAT_URL = f"{EUROSTAT}/sdmx/2.1/data/nrg_bal_c/A....DE"
+
+
+def eurostat_soap(body: str) -> httpx.Response:
+    return httpx.Response(
+        200,
+        content=(
+            '<?xml version="1.0" encoding="UTF-8" ?>\n<env:Envelope xmlns:env='
+            '"http://schemas.xmlsoap.org/soap/envelope/"><env:Header/>'
+            f"<env:Body>{body}</env:Body></env:Envelope>"
+        ),
+    )
+
+
+def mock_queued_extraction(respx_mock, *statuses: str):
+    respx_mock.get(EUROSTAT_URL).mock(
+        return_value=eurostat_soap(
+            "<ns0:syncResponse xmlns:ns0="
+            '"http://estat.ec.europa.eu/disschain/soap/extraction">'
+            "<processingTime>96</processingTime><queued>"
+            f"<id>{EXTRACTION}</id><status>SUBMITTED</status>"
+            "</queued></ns0:syncResponse>"
+        )
+    )
+    respx_mock.get(f"{EUROSTAT}/1.0/async/status/{EXTRACTION}").mock(
+        side_effect=[
+            eurostat_soap(
+                "<ns0:asyncResponse xmlns:ns0="
+                '"http://estat.ec.europa.eu/disschain/soap/asynchronous" '
+                'xmlns:ns1="http://estat.ec.europa.eu/disschain/asynchronous">'
+                f"<ns1:status><ns1:key>{EXTRACTION}</ns1:key>"
+                f"<ns1:status>{status}</ns1:status></ns1:status>"
+                "</ns0:asyncResponse>"
+            )
+            for status in statuses
+        ]
+    )
+
+
+def test_read_url_queued_extraction(respx_mock, monkeypatch, data_path):
+    monkeypatch.setattr(lenient, "_POLL_EVERY", 0.0)
+    mock_queued_extraction(respx_mock, "AVAILABLE")
+    respx_mock.get(f"{EUROSTAT}/1.0/async/data/{EXTRACTION}").mock(
+        return_value=httpx.Response(200, content=Path(data_path).read_bytes())
+    )
+
+    result = read_sdmx(EUROSTAT_URL)
+
+    assert result.data[0].data.equals(read_sdmx(data_path).data[0].data)
+
+
+def test_read_url_extraction_not_available_in_time(respx_mock, monkeypatch):
+    # The timeout also limits the wait for the extraction to be available
+    monkeypatch.setattr(lenient, "_POLL_EVERY", 0.05)
+    # Limited checks, so that the test ends if the timeout is ignored
+    mock_queued_extraction(respx_mock, *["PROCESSING"] * 100)
+
+    with pytest.raises(Invalid, match="not available after 0.2 seconds"):
+        read_sdmx(EUROSTAT_URL, timeout=0.2)
+
+
+@pytest.mark.data
 def test_read_url_invalid_pem():
     url = "https://validurl.com"
     invalid_pem_path = Path(__file__).parent / "samples" / "invalid_pem.pem"
@@ -344,8 +487,29 @@ def test_url_invalid_sdmx_error(respx_mock, sdmx_error_str):
 
 
 def test_empty_result(empty_message):
-    with pytest.raises(Invalid, match="Empty SDMX Message"):
-        read_sdmx(empty_message, validate=False)
+    # A structure message that yields no artefacts is returned as an
+    # empty Message instead of being rejected.
+    msg = read_sdmx(empty_message, validate=False)
+    assert msg.header is not None
+    assert msg.structures == ()
+    assert msg.get_dataflows() == []
+
+
+def test_empty_data_message(empty_data_message):
+    # A data message without any DataSet is valid SDMX (it is how a
+    # service answers a query that matches nothing), so it is returned
+    # as an empty Message instead of being rejected.
+    msg = read_sdmx(empty_data_message, validate=True)
+    assert isinstance(msg, Message)
+    assert msg.header is not None
+    assert msg.data == []
+    assert msg.get_datasets() == []
+
+
+def test_get_datasets_empty_data_message(empty_data_message):
+    # get_datasets keeps its own check, as it requires datasets to work on.
+    with pytest.raises(Invalid, match="No data found in the data message"):
+        get_datasets(empty_data_message, validate=True)
 
 
 def test_get_datasets_valid(data_path, structures_path):
@@ -398,6 +562,19 @@ def test_get_datasets_csv_v1(data_csv_v1_path):
     assert isinstance(dataset.structure, str)
     assert dataset.data is not None
     assert len(dataset.data) == 1000
+
+
+@pytest.mark.parametrize(
+    "csv_file", ["csv_numeric_text_10.csv", "csv_numeric_text_20.csv"]
+)
+def test_read_csv_keeps_values_as_written(samples_folder, csv_file):
+    # Codes such as 01, decimals such as 1.50 and booleans are read as
+    # they are written, as from the same data in SDMX-ML.
+    expected = read_sdmx(samples_folder / "dataset_numeric_text.xml").data[0]
+
+    dataset = read_sdmx(samples_folder / csv_file).data[0]
+
+    pd.testing.assert_frame_equal(dataset.data, expected.data, check_like=True)
 
 
 def test_get_datasets_dataflow_children(data_dataflow, dataflow_children):
@@ -480,6 +657,30 @@ def test_get_json21_structure(sdmx_json_21_structure):
 
 
 @pytest.mark.json
+def test_get_json20_empty_structure(sdmx_json_20_empty_structure):
+    # An SDMX-JSON structure message without artefacts is returned as an
+    # empty Message, like its SDMX-ML counterpart.
+    msg = read_sdmx(sdmx_json_20_empty_structure)
+
+    assert isinstance(msg, Message)
+    assert msg.header is not None
+    assert msg.structures == ()
+    assert msg.get_dataflows() == []
+
+
+@pytest.mark.json
+def test_get_json20_structure_meta_only(sdmx_json_20_structure_meta_only):
+    # The data object is optional in the SDMX-JSON structure schema, so a
+    # message with only a meta object is another valid empty catalogue.
+    msg = read_sdmx(sdmx_json_20_structure_meta_only)
+
+    assert isinstance(msg, Message)
+    assert msg.header is not None
+    assert msg.structures == ()
+    assert msg.get_dataflows() == []
+
+
+@pytest.mark.json
 def test_get_json20_refmeta(sdmx_json_20_refmeta):
     msg = read_sdmx(sdmx_json_20_refmeta, validate=False)
 
@@ -507,6 +708,28 @@ def test_get_json21_refmeta(sdmx_json_21_refmeta):
     assert rep.agency == "BIS.MEDIT"
     assert rep.version == "1.0.42"
     assert len(rep.attributes) == 2
+
+
+@pytest.mark.json
+@pytest.mark.parametrize(
+    "file_name",
+    [
+        "empty_refmeta_message.json",
+        "refmeta_message_empty_data.json",
+        "refmeta_message_meta_only.json",
+    ],
+)
+def test_get_json20_empty_refmeta(file_name):
+    # metadataSets may be empty, and both data and metadataSets are
+    # optional in the SDMX-JSON metadata schema, so all three shapes are
+    # valid reference metadata messages without reports.
+    file_path = Path(__file__).parent / "samples" / file_name
+    msg = read_sdmx(file_path)
+
+    assert isinstance(msg, Message)
+    assert msg.header is not None
+    assert msg.reports == ()
+    assert msg.get_reports() == ()
 
 
 @pytest.mark.json
